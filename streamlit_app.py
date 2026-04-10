@@ -17,7 +17,14 @@ MASTER_SHEET_NAME = "Sheet"
 MASTER_ITEM_COLUMN = "Item"
 MASTER_COMB_COLUMN = "Comb"
 ITEM_COLUMN_ALIASES = ("Item No", "Item Number", "Item #", "Item")
-NUMERIC_COLUMNS = ("Item No", "Quantity", "Price", "Total Cost", "Bid Rank")
+NUMERIC_COLUMNS = (
+    "Item No",
+    "Item Quantity",
+    "Quantity",
+    "Price",
+    "Total Cost",
+    "Bid Rank",
+)
 WorkbookSource = Union[Path, IO[bytes]]
 
 st.set_page_config(page_title="Bid Comparison", page_icon="📊", layout="wide")
@@ -161,6 +168,20 @@ def _coerce_numeric(df: pd.DataFrame, columns: Union[tuple[str, ...], list[str]]
     return df
 
 
+def _add_analysis_quantity(df: pd.DataFrame) -> pd.DataFrame:
+    """Create a single quantity column for spend-weighted comparisons."""
+    df = df.copy()
+    quantity = pd.Series(index=df.index, dtype="float64")
+    for col in ("Item Quantity", "Quantity"):
+        if col not in df.columns:
+            continue
+        current = pd.to_numeric(df[col], errors="coerce")
+        quantity = quantity.combine_first(current)
+    if not quantity.empty:
+        df["Analysis Quantity"] = quantity
+    return df
+
+
 @st.cache_data(show_spinner=False)
 def _load_master_comb_map() -> Dict[float, str]:
     """Load Item -> Comb mapping from the master workbook."""
@@ -293,6 +314,7 @@ def _load_all_sheet(
     dataset = _deduplicate_columns(dataset)
     dataset = _ensure_item_column(dataset)
     dataset = _coerce_numeric(dataset, NUMERIC_COLUMNS)
+    dataset = _add_analysis_quantity(dataset)
     dataset = _apply_master_descriptions(dataset)
     if len(allowed_items):
         dataset = dataset[dataset["Item No"].isin(allowed_items)]
@@ -380,110 +402,108 @@ def combine_datasets(datasets: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
-def apply_filters(df: pd.DataFrame) -> tuple[pd.DataFrame, str, list[int]]:
-    if df.empty or "Item No" not in df.columns:
-        return df, "All bids", []
+def _default_year_pair(year_values: list[int]) -> tuple[Optional[int], Optional[int]]:
+    if not year_values:
+        return None, None
+    comparison_year = year_values[-1]
+    base_year = year_values[-2] if len(year_values) > 1 else comparison_year
+    return base_year, comparison_year
+
+
+def apply_filters(df: pd.DataFrame) -> tuple[pd.DataFrame, Dict[str, Any]]:
+    if df.empty or not {"Item No", "Year"}.issubset(df.columns):
+        return df, {
+            "base_year": None,
+            "comparison_year": None,
+            "history_years": [],
+            "item_query": "",
+        }
+
+    year_values = sorted(
+        pd.to_numeric(df["Year"], errors="coerce").dropna().astype(int).unique().tolist()
+    )
+    default_base, default_comparison = _default_year_pair(year_values)
+
+    item_info = (
+        df[["Item No", "Item Label"]]
+        .dropna(subset=["Item No"])
+        .drop_duplicates("Item No")
+        .sort_values("Item Label")
+        if "Item Label" in df.columns
+        else pd.DataFrame({"Item No": sorted(df["Item No"].dropna().unique().tolist())})
+    )
+    if "Item Label" not in item_info.columns:
+        item_info = item_info.copy()
+        item_info["Item Label"] = item_info["Item No"].apply(_format_item_identifier)
 
     with st.sidebar:
-        st.header("Options")
-        mode = st.radio(
-            "Bid view",
-            options=["All bids", "Lowest bid"],
-            index=0,
-            help="Choose whether to analyze all bids or only the lowest bid per item/year.",
+        st.header("Comparison")
+        comparison_year = st.selectbox(
+            "Comparison year",
+            options=year_values,
+            index=year_values.index(default_comparison)
+            if default_comparison in year_values
+            else 0,
         )
-        st.subheader("Filters")
-        year_values = sorted(df["Year"].dropna().unique().tolist())
-        year_selection = st.multiselect("Year", year_values, default=year_values)
 
-        item_numbers = df["Item No"].dropna().unique().tolist()
-        item_info = (
-            df[["Item No", "Item Label"]]
-            .dropna(subset=["Item No"])
-            .drop_duplicates("Item No")
-            if "Item Label" in df.columns
-            else None
+        base_options = [year for year in year_values if year != comparison_year]
+        if not base_options:
+            base_options = [comparison_year]
+            st.caption("Only one year is available for this bid type.")
+        base_default = default_base if default_base in base_options else base_options[0]
+        base_year = st.selectbox(
+            "Base year",
+            options=base_options,
+            index=base_options.index(base_default),
         )
-        if item_info is not None and not item_info.empty:
-            item_info = item_info.sort_values("Item Label")
-            item_query = st.text_input(
-                "Description contains",
-                value="",
-                help="Literal match. Example: R1-1 matches only descriptions containing R1-1.",
-            ).strip()
-            if item_query:
-                literal_query = re.escape(item_query)
-                item_info = item_info[
-                    item_info["Item Label"].astype(str).str.contains(
-                        literal_query, case=False, na=False, regex=True
-                    )
-                ]
-            item_options = item_info["Item Label"].tolist()
-            selector_mode = st.radio(
-                "Item selector",
-                options=["List view", "Tag view"],
-                index=0,
-                horizontal=True,
-            )
-            if selector_mode == "List view":
-                selection_key = "item_label_selection_map"
-                stored_selection = st.session_state.get(selection_key, {})
-                if not isinstance(stored_selection, dict):
-                    stored_selection = {}
-                current_selection = {
-                    label: bool(stored_selection.get(label, True))
-                    for label in item_options
-                }
-                list_df = pd.DataFrame(
-                    {
-                        "Select": [current_selection[label] for label in item_options],
-                        "Item": item_options,
-                    }
-                )
-                edited_df = st.data_editor(
-                    list_df,
-                    hide_index=True,
-                    use_container_width=True,
-                    height=260,
-                    disabled=["Item"],
-                    column_config={
-                        "Select": st.column_config.CheckboxColumn("Select"),
-                        "Item": st.column_config.TextColumn("Item"),
-                    },
-                    key="item_selector_list_editor",
-                )
-                selected_labels = edited_df.loc[edited_df["Select"], "Item"].tolist()
-                st.session_state[selection_key] = dict(
-                    zip(edited_df["Item"], edited_df["Select"])
-                )
-            else:
-                selected_labels = st.multiselect(
-                    "Items (by description)", item_options, default=item_options
-                )
-            if selected_labels:
-                selected_numbers = item_info[
-                    item_info["Item Label"].isin(selected_labels)
-                ]["Item No"].tolist()
-            else:
-                selected_numbers = item_info["Item No"].tolist()
-        else:
-            item_values = sorted(item_numbers)
-            selected_numbers = st.multiselect(
-                "Item No", item_values, default=item_values
-            )
 
-        org_values = (
-            sorted(df["Organization Name"].dropna().unique().tolist())
-            if "Organization Name" in df.columns
-            else []
+        st.subheader("Item filters")
+        item_query = st.text_input(
+            "Description contains",
+            value="",
+            help="Literal match. Example: R1-1 matches only descriptions containing R1-1.",
+        ).strip()
+
+        filtered_item_info = item_info.copy()
+        if item_query:
+            literal_query = re.escape(item_query)
+            filtered_item_info = filtered_item_info[
+                filtered_item_info["Item Label"].astype(str).str.contains(
+                    literal_query, case=False, na=False, regex=True
+                )
+            ]
+
+        selected_labels = st.multiselect(
+            "Focus items (optional)",
+            options=filtered_item_info["Item Label"].tolist(),
+            default=[],
+            help="Leave blank to compare every item in scope.",
         )
-        org_selection = st.multiselect("Bidders", org_values)
 
-    filtered = df[df["Year"].isin(year_selection)]
-    filtered = filtered[filtered["Item No"].isin(selected_numbers)]
-    if org_selection:
-        filtered = filtered[filtered["Organization Name"].isin(org_selection)]
-    return filtered, mode, year_selection
+        history_years = st.multiselect(
+            "History years",
+            options=year_values,
+            default=year_values,
+            help="Used by the lowest-bid history chart.",
+        )
+        if not history_years:
+            history_years = year_values
+
+    filtered = df.copy()
+    if item_query:
+        filtered = filtered[filtered["Item No"].isin(filtered_item_info["Item No"])]
+    if selected_labels:
+        selected_numbers = filtered_item_info[
+            filtered_item_info["Item Label"].isin(selected_labels)
+        ]["Item No"].tolist()
+        filtered = filtered[filtered["Item No"].isin(selected_numbers)]
+
+    return filtered, {
+        "base_year": int(base_year) if base_year is not None else None,
+        "comparison_year": int(comparison_year) if comparison_year is not None else None,
+        "history_years": sorted({int(year) for year in history_years}),
+        "item_query": item_query,
+    }
 
 def _extract_lowest_bids(df: pd.DataFrame) -> pd.DataFrame:
     """Return lowest bid per item/year with original columns."""
@@ -496,6 +516,8 @@ def _extract_lowest_bids(df: pd.DataFrame) -> pd.DataFrame:
     sort_fields = ["Item No", "Year", "Price"]
     if "Bid Rank" in subset.columns:
         sort_fields.append("Bid Rank")
+    if "Organization Name" in subset.columns:
+        sort_fields.append("Organization Name")
     subset = subset.sort_values(sort_fields)
     winners = (
         subset.groupby(["Item No", "Year"], as_index=False)
@@ -505,224 +527,698 @@ def _extract_lowest_bids(df: pd.DataFrame) -> pd.DataFrame:
     return winners
 
 
-def compute_lowest_bid_view(df: pd.DataFrame) -> pd.DataFrame:
-    """Return the lowest bidders with the same columns as the filtered dataset."""
-    winners = _extract_lowest_bids(df)
-    return winners
+def _format_currency(value: Any) -> str:
+    if pd.isna(value):
+        return "N/A"
+    return f"${value:,.2f}"
 
 
-def _weighted_average_all(df: pd.DataFrame) -> float:
-    if df.empty or not {"Price", "Quantity"}.issubset(df.columns):
+def _format_percent(value: Any) -> str:
+    if pd.isna(value):
+        return "N/A"
+    return f"{value:,.1f}%"
+
+
+def _weighted_average(frame: pd.DataFrame, price_col: str) -> float:
+    quantity_col = "Analysis Quantity"
+    if frame.empty or price_col not in frame.columns or quantity_col not in frame.columns:
         return float("nan")
-    subset = df.dropna(subset=["Price", "Quantity"])
+    subset = frame.dropna(subset=[price_col, quantity_col]).copy()
     if subset.empty:
         return float("nan")
-    total_quantity = subset["Quantity"].sum()
+    total_quantity = subset[quantity_col].sum()
     if not total_quantity or pd.isna(total_quantity):
         return float("nan")
-    return (subset["Price"] * subset["Quantity"]).sum() / total_quantity
+    return (subset[price_col] * subset[quantity_col]).sum() / total_quantity
 
 
-def _weighted_average_lowest(df: pd.DataFrame) -> float:
-    winners = _extract_lowest_bids(df)
-    if winners.empty or "Quantity" not in winners.columns:
-        return float("nan")
-    subset = winners.dropna(subset=["Price", "Quantity"])
-    if subset.empty:
-        return float("nan")
-    total_quantity = subset["Quantity"].sum()
-    if not total_quantity or pd.isna(total_quantity):
-        return float("nan")
-    return (subset["Price"] * subset["Quantity"]).sum() / total_quantity
-
-
-def show_metrics(df: pd.DataFrame, mode: str) -> None:
-    if df.empty:
-        st.info("No bids match the current filters.")
-        return
-
-    col_items, col_orgs, col_avg, col_weighted = st.columns(4)
-    distinct_items = df["Item No"].nunique()
-    col_items.metric("Distinct items", f"{distinct_items:,}")
-
-    distinct_bidders = (
-        df["Organization Name"].nunique() if "Organization Name" in df.columns else 0
-    )
-    col_orgs.metric("Bidders", f"{distinct_bidders:,}")
-
-    avg_price = df["Price"].mean() if "Price" in df.columns else float("nan")
-    avg_price_display = f"${avg_price:,.2f}" if pd.notna(avg_price) else "N/A"
-    col_avg.metric("Average unit price", avg_price_display)
-
-    if mode == "Lowest bid":
-        weighted_avg = _weighted_average_lowest(df)
-        label = "Weighted avg (lowest bid)"
-    else:
-        weighted_avg = _weighted_average_all(df)
-        label = "Weighted avg (all)"
-    weighted_display = f"${weighted_avg:,.2f}" if pd.notna(weighted_avg) else "N/A"
-    col_weighted.metric(label, weighted_display)
-
-
-def prepare_price_history(
-    df: pd.DataFrame, mode: str, year_domain: Optional[list[int]] = None
-) -> pd.DataFrame:
-    if df.empty or "Year" not in df.columns:
+def build_item_year_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Summarize each item/year with bid counts and lowest-bid results."""
+    required = {"Item No", "Year"}
+    if df.empty or not required.issubset(df.columns):
         return pd.DataFrame()
 
-    base = df.copy()
+    base = _add_analysis_quantity(df)
+    base = base.copy()
     base["Year"] = pd.to_numeric(base["Year"], errors="coerce")
-    base = base.dropna(subset=["Year"])
+    base["Item No"] = pd.to_numeric(base["Item No"], errors="coerce")
+    base = base.dropna(subset=["Item No", "Year"])
     if base.empty:
         return pd.DataFrame()
     base["Year"] = base["Year"].astype(int)
 
-    if year_domain:
-        years = sorted({int(y) for y in year_domain})
-    else:
-        years = sorted(base["Year"].dropna().unique().tolist())
-    if not years:
-        return pd.DataFrame()
+    metadata_cols = [
+        col
+        for col in [
+            "Item No",
+            "Year",
+            "Item Label",
+            "Description",
+            "UOM",
+            "Analysis Quantity",
+        ]
+        if col in base.columns
+    ]
+    metadata = (
+        base.sort_values(["Year", "Item No"], ascending=[False, True])[metadata_cols]
+        .drop_duplicates(["Item No", "Year"])
+        if metadata_cols
+        else pd.DataFrame(columns=["Item No", "Year"])
+    )
 
-    if mode == "Lowest bid":
-        if "Item No" not in base.columns:
-            return pd.DataFrame()
-        if "Item Label" not in base.columns:
-            base["Item Label"] = "Item " + base["Item No"].astype(str)
-        item_info = (
-            base[["Item No", "Item Label"]]
-            .dropna(subset=["Item No"])
-            .drop_duplicates("Item No")
-        )
-        if item_info.empty:
-            return pd.DataFrame()
-
-        if "Price" in base.columns:
-            price_rows = base.dropna(subset=["Price"]).copy()
-            if not price_rows.empty:
-                price_rows = price_rows.groupby(["Item No", "Year"], as_index=False)[
-                    "Price"
-                ].mean()
-            else:
-                price_rows = pd.DataFrame(columns=["Item No", "Year", "Price"])
-        else:
-            price_rows = pd.DataFrame(columns=["Item No", "Year", "Price"])
-
-        year_df = pd.DataFrame({"Year": years})
-        year_df["_key"] = 1
-        item_info = item_info.copy()
-        item_info["_key"] = 1
-        grid = item_info.merge(year_df, on="_key", how="inner").drop(columns=["_key"])
-        result = grid.merge(price_rows, on=["Item No", "Year"], how="left")
-        result["Bid Status"] = result["Price"].where(
-            result["Price"].notna(), "Not bid this year"
-        )
-        result["Bid Status"] = result["Bid Status"].where(
-            result["Bid Status"] == "Not bid this year", "Bid"
-        )
+    priced = base.dropna(subset=["Price"]).copy()
+    if priced.empty:
+        result = metadata.copy()
+        for col in [
+            "Bid Count",
+            "Bidder Count",
+            "Average Price",
+            "Lowest Price",
+            "Highest Price",
+            "Lowest Bidder",
+            "Lowest Bid Rank",
+            "Lowest Total Cost",
+            "Estimated Low Spend",
+        ]:
+            result[col] = pd.NA
         return result
 
-    if "Price" not in base.columns:
-        return pd.DataFrame()
-
-    summary = (
-        base.dropna(subset=["Price"]).groupby("Year", as_index=False)["Price"].mean()
-    )
-    result = pd.DataFrame({"Year": years}).merge(summary, on="Year", how="left")
-    result["Price"] = result["Price"].round(2)
-    result["Item Label"] = "Average of all bids"
-    result["Bid Status"] = result["Price"].where(
-        result["Price"].notna(), "Not bid this year"
-    )
-    result["Bid Status"] = result["Bid Status"].where(
-        result["Bid Status"] == "Not bid this year", "Bid"
-    )
-    return result
-
-
-def compute_lowest_bid_table(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a per-item view of the lowest bidder per year."""
-    required_cols = {"Item No", "Year", "Price", "Organization Name"}
-    if df.empty or not required_cols.issubset(df.columns):
-        return pd.DataFrame()
-
-    sortable = df.dropna(subset=["Price"]).copy()
-    if sortable.empty:
-        return pd.DataFrame()
-
-    sort_fields = ["Item No", "Year", "Price"]
-    if "Bid Rank" in sortable.columns:
-        sort_fields.append("Bid Rank")
-    sortable = sortable.sort_values(sort_fields)
-
-    winners = (
-        sortable.groupby(["Item No", "Year"], as_index=False)
-        .first()
-        .copy()
-    )
-    if winners.empty:
-        return pd.DataFrame()
-
-    metadata_cols = [col for col in df.columns if col.startswith("Item ")]
-    metadata = (
-        df[["Item No"] + metadata_cols]
-        .drop_duplicates("Item No")
-        .pipe(_deduplicate_columns)
-        if metadata_cols
-        else None
+    summary = priced.groupby(["Item No", "Year"], as_index=False).agg(
+        **{
+            "Bid Count": ("Price", "size"),
+            "Average Price": ("Price", "mean"),
+            "Lowest Price": ("Price", "min"),
+            "Highest Price": ("Price", "max"),
+        }
     )
 
-    pivot_cols = [
-        col
-        for col in ["Organization Name", "Price", "Total Cost", "Bid Rank"]
-        if col in winners.columns
-    ]
-    pivot = winners.pivot(index="Item No", columns="Year", values=pivot_cols)
-    pivot.columns = [f"{col}_{int(year)}" for col, year in pivot.columns]
-    result = pivot.reset_index()
+    if "Organization Name" in priced.columns:
+        bidder_counts = (
+            priced.groupby(["Item No", "Year"])["Organization Name"]
+            .nunique()
+            .reset_index(name="Bidder Count")
+        )
+        summary = summary.merge(bidder_counts, on=["Item No", "Year"], how="left")
+    else:
+        summary["Bidder Count"] = pd.NA
 
+    winners = _extract_lowest_bids(base)
+    winner_cols = ["Item No", "Year"]
     rename_map: Dict[str, str] = {}
-    for col in list(result.columns):
-        if "_" not in col:
-            continue
-        metric, year_token = col.rsplit("_", 1)
-        if not year_token.isdigit():
-            continue
-        metric_label = {
-            "Organization Name": "Winner",
-            "Price": "Price",
-            "Total Cost": "Total Cost",
-            "Bid Rank": "Bid Rank",
-        }.get(metric, metric)
-        rename_map[col] = f"{metric_label} {year_token}"
+    if "Organization Name" in winners.columns:
+        winner_cols.append("Organization Name")
+        rename_map["Organization Name"] = "Lowest Bidder"
+    if "Bid Rank" in winners.columns:
+        winner_cols.append("Bid Rank")
+        rename_map["Bid Rank"] = "Lowest Bid Rank"
+    if "Total Cost" in winners.columns:
+        winner_cols.append("Total Cost")
+        rename_map["Total Cost"] = "Lowest Total Cost"
 
-    result = result.rename(columns=rename_map)
-
-    if metadata is not None and not metadata.empty:
-        result = result.merge(metadata, on="Item No", how="left")
-
-    price_columns = sorted(
-        [
-            (int(col.split(" ", 1)[-1]), col)
-            for col in result.columns
-            if col.startswith("Price ") and col.split(" ", 1)[-1].isdigit()
-        ]
-    )
-    if len(price_columns) >= 2:
-        earliest_year, earliest_col = price_columns[0]
-        latest_year, latest_col = price_columns[-1]
-        result[earliest_col] = pd.to_numeric(result[earliest_col], errors="coerce")
-        result[latest_col] = pd.to_numeric(result[latest_col], errors="coerce")
-        result["Price Δ"] = result[latest_col] - result[earliest_col]
-        denom = result[earliest_col].replace(0, pd.NA)
-        result["Price Δ%"] = ((result[latest_col] - result[earliest_col]) / denom) * 100
-
+    winner_summary = winners[winner_cols].rename(columns=rename_map)
+    result = metadata.merge(summary, on=["Item No", "Year"], how="outer")
+    result = result.merge(winner_summary, on=["Item No", "Year"], how="left")
+    if {"Lowest Price", "Analysis Quantity"}.issubset(result.columns):
+        result["Estimated Low Spend"] = result["Lowest Price"] * result["Analysis Quantity"]
+    else:
+        result["Estimated Low Spend"] = pd.NA
     return result
+
+
+def build_year_pair_comparison(
+    summary: pd.DataFrame, base_year: int, comparison_year: int
+) -> pd.DataFrame:
+    """Return a side-by-side comparison for the selected year pair."""
+    if summary.empty:
+        return pd.DataFrame()
+
+    item_info_cols = [
+        col
+        for col in ["Item No", "Item Label", "Description", "UOM"]
+        if col in summary.columns
+    ]
+    item_info = (
+        summary.sort_values(["Year", "Item No"], ascending=[False, True])[item_info_cols]
+        .drop_duplicates("Item No")
+        if item_info_cols
+        else pd.DataFrame(columns=["Item No"])
+    )
+
+    metric_cols = [
+        col
+        for col in [
+            "Analysis Quantity",
+            "Bid Count",
+            "Bidder Count",
+            "Average Price",
+            "Lowest Price",
+            "Highest Price",
+            "Lowest Bidder",
+            "Lowest Bid Rank",
+            "Lowest Total Cost",
+            "Estimated Low Spend",
+        ]
+        if col in summary.columns
+    ]
+
+    def _year_frame(year: int) -> pd.DataFrame:
+        frame = summary[summary["Year"] == year][["Item No"] + metric_cols].copy()
+        rename = {col: f"{col} {year}" for col in frame.columns if col != "Item No"}
+        return frame.rename(columns=rename)
+
+    base_frame = _year_frame(base_year)
+    comparison_frame = _year_frame(comparison_year)
+    result = item_info.merge(base_frame, on="Item No", how="left")
+    result = result.merge(comparison_frame, on="Item No", how="left")
+
+    base_price_col = f"Lowest Price {base_year}"
+    comparison_price_col = f"Lowest Price {comparison_year}"
+    base_bidder_col = f"Lowest Bidder {base_year}"
+    comparison_bidder_col = f"Lowest Bidder {comparison_year}"
+    base_spend_col = f"Estimated Low Spend {base_year}"
+    comparison_spend_col = f"Estimated Low Spend {comparison_year}"
+
+    result = result[
+        result[base_price_col].notna() | result[comparison_price_col].notna()
+    ].copy()
+    if result.empty:
+        return result
+
+    result["Price Change"] = result[comparison_price_col] - result[base_price_col]
+    denom = result[base_price_col].replace(0, pd.NA)
+    result["Price Change %"] = ((result["Price Change"] / denom) * 100).astype("float64")
+
+    if {base_spend_col, comparison_spend_col}.issubset(result.columns):
+        result["Estimated Spend Change"] = (
+            result[comparison_spend_col] - result[base_spend_col]
+        )
+    else:
+        result["Estimated Spend Change"] = pd.NA
+
+    result["Winner Changed"] = (
+        result[base_bidder_col].notna()
+        & result[comparison_bidder_col].notna()
+        & (result[base_bidder_col] != result[comparison_bidder_col])
+    )
+
+    result["Status"] = "No valid bids"
+    result.loc[
+        result[base_price_col].notna() & result[comparison_price_col].notna(),
+        "Status",
+    ] = "Bid in both years"
+    result.loc[
+        result[base_price_col].notna() & result[comparison_price_col].isna(),
+        "Status",
+    ] = f"Only {base_year}"
+    result.loc[
+        result[base_price_col].isna() & result[comparison_price_col].notna(),
+        "Status",
+    ] = f"Only {comparison_year}"
+    result["Absolute Price Change"] = result["Price Change"].abs()
+
+    status_order = {
+        "Bid in both years": 0,
+        f"Only {comparison_year}": 1,
+        f"Only {base_year}": 2,
+        "No valid bids": 99,
+    }
+    result["Status Order"] = result["Status"].map(status_order).fillna(99)
+    result = result.sort_values(
+        ["Status Order", "Absolute Price Change", "Item Label"],
+        ascending=[True, False, True],
+    )
+    return result
+
+
+def compute_year_metrics(
+    raw_df: pd.DataFrame, summary: pd.DataFrame, year: int
+) -> Dict[str, Any]:
+    raw_year = raw_df[pd.to_numeric(raw_df["Year"], errors="coerce") == year].copy()
+    priced_year = (
+        raw_year.dropna(subset=["Price"]).copy() if "Price" in raw_year.columns else raw_year
+    )
+    summary_year = summary[summary["Year"] == year].copy()
+
+    estimated_spend = float("nan")
+    if "Estimated Low Spend" in summary_year.columns:
+        spend_series = pd.to_numeric(summary_year["Estimated Low Spend"], errors="coerce")
+        if spend_series.notna().any():
+            estimated_spend = spend_series.sum()
+
+    return {
+        "items_bid": int(summary_year["Lowest Price"].notna().sum())
+        if "Lowest Price" in summary_year.columns
+        else 0,
+        "bid_rows": int(len(priced_year)),
+        "bidders": int(priced_year["Organization Name"].nunique())
+        if "Organization Name" in priced_year.columns
+        else 0,
+        "weighted_low_price": _weighted_average(summary_year, "Lowest Price"),
+        "estimated_low_spend": estimated_spend,
+    }
+
+
+def show_comparison_summary(
+    raw_df: pd.DataFrame,
+    summary: pd.DataFrame,
+    comparison: pd.DataFrame,
+    base_year: int,
+    comparison_year: int,
+) -> None:
+    base_metrics = compute_year_metrics(raw_df, summary, base_year)
+    comparison_metrics = compute_year_metrics(raw_df, summary, comparison_year)
+    overlap = (
+        comparison[comparison["Status"] == "Bid in both years"]
+        if not comparison.empty
+        else pd.DataFrame()
+    )
+
+    st.subheader(f"Year comparison: {comparison_year} vs {base_year}")
+    st.caption(
+        "The dashboard now compares the selected year pair first, then lets you drill into item history and raw bid rows."
+    )
+
+    left_col, right_col = st.columns(2)
+    with left_col:
+        st.markdown(f"**{base_year}**")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Items bid", f"{base_metrics['items_bid']:,}")
+        c2.metric("Bid rows", f"{base_metrics['bid_rows']:,}")
+        c3.metric("Bidders", f"{base_metrics['bidders']:,}")
+        c4.metric("Weighted low", _format_currency(base_metrics["weighted_low_price"]))
+        st.caption(
+            f"Estimated low-bid spend: {_format_currency(base_metrics['estimated_low_spend'])}"
+        )
+
+    with right_col:
+        st.markdown(f"**{comparison_year}**")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric(
+            "Items bid",
+            f"{comparison_metrics['items_bid']:,}",
+            delta=f"{comparison_metrics['items_bid'] - base_metrics['items_bid']:+,}",
+        )
+        c2.metric(
+            "Bid rows",
+            f"{comparison_metrics['bid_rows']:,}",
+            delta=f"{comparison_metrics['bid_rows'] - base_metrics['bid_rows']:+,}",
+        )
+        c3.metric(
+            "Bidders",
+            f"{comparison_metrics['bidders']:,}",
+            delta=f"{comparison_metrics['bidders'] - base_metrics['bidders']:+,}",
+        )
+        weighted_delta = (
+            comparison_metrics["weighted_low_price"] - base_metrics["weighted_low_price"]
+            if pd.notna(comparison_metrics["weighted_low_price"])
+            and pd.notna(base_metrics["weighted_low_price"])
+            else float("nan")
+        )
+        c4.metric(
+            "Weighted low",
+            _format_currency(comparison_metrics["weighted_low_price"]),
+            delta=_format_currency(weighted_delta) if pd.notna(weighted_delta) else None,
+        )
+        spend_delta = (
+            comparison_metrics["estimated_low_spend"] - base_metrics["estimated_low_spend"]
+            if pd.notna(comparison_metrics["estimated_low_spend"])
+            and pd.notna(base_metrics["estimated_low_spend"])
+            else float("nan")
+        )
+        caption = (
+            f"Estimated low-bid spend: {_format_currency(comparison_metrics['estimated_low_spend'])}"
+        )
+        if pd.notna(spend_delta):
+            caption += f" ({_format_currency(spend_delta)} vs {base_year})"
+        st.caption(caption)
+
+    summary_cols = st.columns(5)
+    new_count = int((comparison["Status"] == f"Only {comparison_year}").sum())
+    dropped_count = int((comparison["Status"] == f"Only {base_year}").sum())
+    winner_changes = int(comparison["Winner Changed"].fillna(False).sum())
+    median_delta = (
+        pd.to_numeric(overlap["Price Change %"], errors="coerce").median()
+        if not overlap.empty
+        else float("nan")
+    )
+    summary_cols[0].metric("Items in both years", f"{len(overlap):,}")
+    summary_cols[1].metric(f"New in {comparison_year}", f"{new_count:,}")
+    summary_cols[2].metric(f"Dropped after {base_year}", f"{dropped_count:,}")
+    summary_cols[3].metric("Winner changes", f"{winner_changes:,}")
+    summary_cols[4].metric("Median price change", _format_percent(median_delta))
+
+
+def show_status_chart(comparison: pd.DataFrame, base_year: int, comparison_year: int) -> None:
+    if comparison.empty:
+        st.info("No item-level comparison is available for the current filters.")
+        return
+
+    status_order = ["Bid in both years", f"Only {comparison_year}", f"Only {base_year}"]
+    counts = (
+        comparison["Status"]
+        .value_counts()
+        .reindex(status_order, fill_value=0)
+        .rename_axis("Status")
+        .reset_index(name="Items")
+    )
+    chart = (
+        alt.Chart(counts)
+        .mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6)
+        .encode(
+            x=alt.X("Status:N", sort=status_order, title=None),
+            y=alt.Y("Items:Q", title="Items"),
+            color=alt.Color(
+                "Status:N",
+                scale=alt.Scale(
+                    domain=status_order,
+                    range=["#2a6f97", "#6a994e", "#c65d2e"],
+                ),
+                legend=None,
+            ),
+            tooltip=[
+                alt.Tooltip("Status:N", title="Status"),
+                alt.Tooltip("Items:Q", title="Items"),
+            ],
+        )
+    )
+    text = chart.mark_text(dy=-8, color="#243b53").encode(text="Items:Q")
+    st.altair_chart((chart + text).properties(height=280), use_container_width=True)
+
+
+def _truncate_label(value: Any, length: int = 68) -> str:
+    text = str(value) if pd.notna(value) else ""
+    if len(text) <= length:
+        return text
+    return text[: length - 3] + "..."
+
+
+def show_top_moves_chart(comparison: pd.DataFrame, base_year: int, comparison_year: int) -> None:
+    overlap = comparison[comparison["Status"] == "Bid in both years"].copy()
+    overlap = overlap.dropna(subset=["Price Change"])
+    if overlap.empty:
+        st.info("No overlapping item prices are available to chart.")
+        return
+
+    increase_count = min(6, int((overlap["Price Change"] > 0).sum()))
+    decrease_count = min(6, int((overlap["Price Change"] < 0).sum()))
+    chart_df = pd.concat(
+        [
+            overlap[overlap["Price Change"] < 0].nsmallest(decrease_count, "Price Change"),
+            overlap[overlap["Price Change"] > 0].nlargest(increase_count, "Price Change"),
+        ],
+        ignore_index=True,
+    )
+    if chart_df.empty:
+        chart_df = overlap.nlargest(min(12, len(overlap)), "Absolute Price Change")
+
+    chart_df = chart_df.drop_duplicates("Item No").copy()
+    chart_df["Direction"] = chart_df["Price Change"].apply(
+        lambda value: "Increase" if value > 0 else "Decrease"
+    )
+    chart_df["Chart Label"] = chart_df["Item Label"].apply(_truncate_label)
+    chart_df = chart_df.sort_values("Price Change")
+
+    zero = alt.Chart(pd.DataFrame({"Zero": [0]})).mark_rule(
+        color="#7b8794", strokeDash=[4, 4]
+    ).encode(x="Zero:Q")
+    bars = (
+        alt.Chart(chart_df)
+        .mark_bar()
+        .encode(
+            y=alt.Y("Chart Label:N", sort=chart_df["Chart Label"].tolist(), title=None),
+            x=alt.X(
+                "Price Change:Q",
+                title=f"Lowest price change ({comparison_year} - {base_year})",
+            ),
+            color=alt.Color(
+                "Direction:N",
+                scale=alt.Scale(
+                    domain=["Decrease", "Increase"],
+                    range=["#c65d2e", "#2a9d8f"],
+                ),
+                legend=None,
+            ),
+            tooltip=[
+                alt.Tooltip("Item Label:N", title="Item"),
+                alt.Tooltip(
+                    f"Lowest Price {base_year}:Q",
+                    title=f"{base_year} low",
+                    format="$.2f",
+                ),
+                alt.Tooltip(
+                    f"Lowest Price {comparison_year}:Q",
+                    title=f"{comparison_year} low",
+                    format="$.2f",
+                ),
+                alt.Tooltip("Price Change:Q", title="Change", format="$.2f"),
+                alt.Tooltip("Price Change %:Q", title="Change %", format=".1f"),
+                alt.Tooltip("Status:N", title="Status"),
+            ],
+        )
+    )
+    height = max(320, len(chart_df) * 28)
+    st.altair_chart((zero + bars).properties(height=height), use_container_width=True)
+
+
+def prepare_history(summary: pd.DataFrame, item_numbers: list[float], years: list[int]) -> pd.DataFrame:
+    if summary.empty or not item_numbers or not years:
+        return pd.DataFrame()
+
+    item_info = (
+        summary[summary["Item No"].isin(item_numbers)][["Item No", "Item Label"]]
+        .drop_duplicates("Item No")
+        .sort_values("Item Label")
+    )
+    if item_info.empty:
+        return pd.DataFrame()
+
+    year_df = pd.DataFrame({"Year": years})
+    year_df["_key"] = 1
+    item_info = item_info.copy()
+    item_info["_key"] = 1
+    grid = item_info.merge(year_df, on="_key", how="inner").drop(columns=["_key"])
+
+    summary_cols = [
+        col
+        for col in [
+            "Item No",
+            "Year",
+            "Lowest Price",
+            "Lowest Bidder",
+            "Bid Count",
+            "Bidder Count",
+        ]
+        if col in summary.columns
+    ]
+    history = grid.merge(
+        summary[summary["Year"].isin(years)][summary_cols],
+        on=["Item No", "Year"],
+        how="left",
+    )
+    history["Bid Status"] = history["Lowest Price"].where(
+        history["Lowest Price"].notna(), "Not bid this year"
+    )
+    history["Bid Status"] = history["Bid Status"].where(
+        history["Bid Status"] == "Not bid this year", "Bid"
+    )
+    return history
+
+
+def show_history_chart(summary: pd.DataFrame, comparison: pd.DataFrame, years: list[int]) -> None:
+    if summary.empty or comparison.empty:
+        st.info("No history is available for the current scope.")
+        return
+
+    chart_item_info = (
+        comparison[["Item No", "Item Label", "Absolute Price Change"]]
+        .drop_duplicates("Item No")
+        .sort_values(["Absolute Price Change", "Item Label"], ascending=[False, True])
+    )
+    label_options = chart_item_info["Item Label"].tolist()
+    default_labels = label_options[: min(5, len(label_options))]
+    selected_labels = st.multiselect(
+        "Items to chart",
+        options=label_options,
+        default=default_labels,
+        help="Defaults to the biggest movers in the selected year pair.",
+    )
+    if not selected_labels:
+        st.info("Select at least one item to display the history chart.")
+        return
+
+    selected_items = chart_item_info[
+        chart_item_info["Item Label"].isin(selected_labels)
+    ]["Item No"].tolist()
+    history = prepare_history(summary, selected_items, years)
+    if history.empty:
+        st.info("No history is available for the selected items.")
+        return
+
+    bid_rows = history[history["Lowest Price"].notna()].copy()
+    not_bid_rows = history[history["Lowest Price"].isna()].copy()
+    base_encoding = {
+        "x": alt.X("Year:O", title="Year", sort=years),
+        "color": alt.Color("Item Label:N", title="Item"),
+    }
+
+    line = (
+        alt.Chart(bid_rows)
+        .mark_line(point=True)
+        .encode(
+            **base_encoding,
+            y=alt.Y("Lowest Price:Q", title="Lowest bid price"),
+            detail="Item No:N",
+            tooltip=[
+                alt.Tooltip("Item Label:N", title="Item"),
+                alt.Tooltip("Year:O", title="Year"),
+                alt.Tooltip("Lowest Price:Q", title="Lowest price", format="$.2f"),
+                alt.Tooltip("Lowest Bidder:N", title="Lowest bidder"),
+                alt.Tooltip("Bid Count:Q", title="Bid rows"),
+                alt.Tooltip("Bidder Count:Q", title="Bidders"),
+                alt.Tooltip("Bid Status:N", title="Status"),
+            ],
+        )
+    )
+
+    if not not_bid_rows.empty:
+        if len(selected_items) == 1:
+            not_bid_mark = alt.Chart(not_bid_rows).mark_text(
+                text="Not bid", dy=-8, fontSize=10, color="#7b8794"
+            )
+        else:
+            not_bid_mark = alt.Chart(not_bid_rows).mark_point(
+                shape="cross", size=90, color="#7b8794"
+            )
+        not_bid = not_bid_mark.encode(
+            **base_encoding,
+            y=alt.value(16),
+            tooltip=[
+                alt.Tooltip("Item Label:N", title="Item"),
+                alt.Tooltip("Year:O", title="Year"),
+                alt.Tooltip("Bid Status:N", title="Status"),
+            ],
+        )
+        chart = line + not_bid
+    else:
+        chart = line
+
+    st.altair_chart(chart.properties(height=420), use_container_width=True)
+
+
+def build_comparison_column_config(base_year: int, comparison_year: int) -> Dict[str, Any]:
+    return {
+        "Item Label": st.column_config.TextColumn("Item", width="large"),
+        f"Lowest Price {base_year}": st.column_config.NumberColumn(
+            f"Lowest Price {base_year}", format="$%.2f"
+        ),
+        f"Lowest Price {comparison_year}": st.column_config.NumberColumn(
+            f"Lowest Price {comparison_year}", format="$%.2f"
+        ),
+        "Price Change": st.column_config.NumberColumn("Price Change", format="$%.2f"),
+        "Price Change %": st.column_config.NumberColumn("Price Change %", format="%.1f%%"),
+        f"Estimated Low Spend {base_year}": st.column_config.NumberColumn(
+            f"Est. Spend {base_year}", format="$%.2f"
+        ),
+        f"Estimated Low Spend {comparison_year}": st.column_config.NumberColumn(
+            f"Est. Spend {comparison_year}", format="$%.2f"
+        ),
+        "Estimated Spend Change": st.column_config.NumberColumn(
+            "Est. Spend Change", format="$%.2f"
+        ),
+        "Winner Changed": st.column_config.CheckboxColumn("Winner changed"),
+    }
+
+
+def show_comparison_table(
+    comparison: pd.DataFrame, base_year: int, comparison_year: int
+) -> pd.DataFrame:
+    if comparison.empty:
+        st.info("No item comparison is available for the selected years.")
+        return comparison
+
+    status_options = ["Bid in both years", f"Only {comparison_year}", f"Only {base_year}"]
+    control_cols = st.columns([2, 1, 1])
+    selected_statuses = control_cols[0].multiselect(
+        "Statuses",
+        options=status_options,
+        default=status_options,
+    )
+    winner_changes_only = control_cols[1].checkbox("Winner changes only", value=False)
+    sort_choice = control_cols[2].selectbox(
+        "Sort",
+        options=[
+            "Largest absolute change",
+            "Largest increase",
+            "Largest decrease",
+            "Item",
+        ],
+    )
+
+    table = comparison[comparison["Status"].isin(selected_statuses)].copy()
+    if winner_changes_only:
+        table = table[table["Winner Changed"]]
+
+    if sort_choice == "Largest increase":
+        table = table.sort_values("Price Change", ascending=False)
+    elif sort_choice == "Largest decrease":
+        table = table.sort_values("Price Change", ascending=True)
+    elif sort_choice == "Item":
+        table = table.sort_values("Item Label")
+    else:
+        table = table.sort_values("Absolute Price Change", ascending=False)
+
+    display_columns = [
+        col
+        for col in [
+            "Item No",
+            "Item Label",
+            "Status",
+            f"Lowest Bidder {base_year}",
+            f"Lowest Price {base_year}",
+            f"Lowest Bidder {comparison_year}",
+            f"Lowest Price {comparison_year}",
+            "Price Change",
+            "Price Change %",
+            "Winner Changed",
+            f"Bidder Count {base_year}",
+            f"Bidder Count {comparison_year}",
+            f"Bid Count {base_year}",
+            f"Bid Count {comparison_year}",
+            f"Estimated Low Spend {base_year}",
+            f"Estimated Low Spend {comparison_year}",
+            "Estimated Spend Change",
+        ]
+        if col in table.columns
+    ]
+    st.dataframe(
+        table[display_columns],
+        use_container_width=True,
+        column_config=build_comparison_column_config(base_year, comparison_year),
+    )
+    return table
+
+
+def show_raw_bid_detail(df: pd.DataFrame, base_year: int, comparison_year: int) -> pd.DataFrame:
+    years = sorted({base_year, comparison_year})
+    detail = df[df["Year"].isin(years)].copy()
+    if detail.empty:
+        return detail
+
+    sort_cols = [
+        col for col in ["Item Label", "Year", "Price", "Organization Name"] if col in detail.columns
+    ]
+    if sort_cols:
+        detail = detail.sort_values(sort_cols)
+    with st.expander("Raw bid detail for the selected years"):
+        st.dataframe(detail, use_container_width=True)
+    return detail
 
 
 def main() -> None:
     st.title("Bid Comparison From Excel")
-    st.caption("Compare item-level bids across years using the cleaned Excel workbooks.")
+    st.caption(
+        "Compare item-level bids across years using a year-first view instead of a single all-years average."
+    )
 
     datasets = load_datasets()
     if not datasets:
@@ -734,145 +1230,49 @@ def main() -> None:
         st.warning("No bid data found in the selected workbooks.")
         return
 
-    filtered, mode, year_selection = apply_filters(combined)
-    if mode == "Lowest bid":
-        display_df = compute_lowest_bid_view(filtered)
-    else:
-        display_df = filtered
+    filtered, options = apply_filters(combined)
+    base_year = options["base_year"]
+    comparison_year = options["comparison_year"]
+    if base_year is None or comparison_year is None:
+        st.warning("Select a valid pair of years to compare.")
+        return
 
-    show_metrics(display_df, mode)
+    summary = build_item_year_summary(filtered)
+    comparison = build_year_pair_comparison(summary, base_year, comparison_year)
+    if comparison.empty:
+        st.warning("No bids match the selected items for the chosen year pair.")
+        return
 
-    st.subheader("Bid detail")
-    st.dataframe(display_df, use_container_width=True)
+    show_comparison_summary(filtered, summary, comparison, base_year, comparison_year)
 
-    lowest = compute_lowest_bid_table(filtered)
-    st.subheader("Lowest bid by item")
-    if lowest.empty:
-        st.info("Select both years with price data to compare lowest bids.")
-    else:
-        st.dataframe(lowest, use_container_width=True)
-        st.download_button(
-            "Download lowest-bid comparison",
-            data=lowest.to_csv(index=False),
-            file_name="lowest_bid_comparison.csv",
-            mime="text/csv",
-        )
+    chart_cols = st.columns([1, 2])
+    with chart_cols[0]:
+        st.subheader("Coverage changes")
+        show_status_chart(comparison, base_year, comparison_year)
+    with chart_cols[1]:
+        st.subheader("Biggest price moves")
+        show_top_moves_chart(comparison, base_year, comparison_year)
 
-    st.subheader("Price history")
-    selected_year_domain = sorted([int(y) for y in year_selection]) if year_selection else None
-    history = prepare_price_history(display_df, mode, year_domain=selected_year_domain)
-    if history.empty:
-        st.info("No price history available for the selected scope.")
-    else:
-        if mode == "Lowest bid":
-            chart_item_info = (
-                history[["Item No", "Item Label"]]
-                .dropna(subset=["Item No"])
-                .drop_duplicates(["Item No", "Item Label"])
-                .sort_values("Item Label")
-            )
-            label_options = chart_item_info["Item Label"].tolist()
-            default_labels = label_options[: min(5, len(label_options))]
-            selected_labels = st.multiselect(
-                "Items to chart (by description)",
-                options=label_options,
-                default=default_labels,
-                help="Select which items to visualize.",
-            )
-            if not selected_labels:
-                st.info("Select at least one item to display the chart.")
-            else:
-                selected_items = chart_item_info[
-                    chart_item_info["Item Label"].isin(selected_labels)
-                ]["Item No"].tolist()
-                chart_data = history[history["Item No"].isin(selected_items)].copy()
-                year_sort = sorted(chart_data["Year"].dropna().unique().tolist())
-                bid_rows = chart_data[chart_data["Price"].notna()]
-                not_bid_rows = chart_data[chart_data["Price"].isna()]
-
-                base_encoding = {
-                    "x": alt.X("Year:O", title="Year", sort=year_sort),
-                    "color": alt.Color("Item Label:N", title="Item"),
-                }
-                line = (
-                    alt.Chart(bid_rows)
-                    .mark_line(point=True)
-                    .encode(
-                        **base_encoding,
-                        y=alt.Y("Price:Q", title="Unit price"),
-                        tooltip=[
-                            alt.Tooltip("Item Label:N", title="Item"),
-                            alt.Tooltip("Year:O", title="Year"),
-                            alt.Tooltip("Price:Q", title="Price", format="$.2f"),
-                            alt.Tooltip("Bid Status:N", title="Status"),
-                        ],
-                    )
-                )
-
-                if not_bid_rows.empty:
-                    chart = line.properties(height=400)
-                else:
-                    if len(selected_items) == 1:
-                        not_bid_mark = alt.Chart(not_bid_rows).mark_text(
-                            text="Not bid", dy=-8, fontSize=10
-                        )
-                    else:
-                        not_bid_mark = alt.Chart(not_bid_rows).mark_point(
-                            shape="cross", size=80
-                        )
-                    not_bid = not_bid_mark.encode(
-                        **base_encoding,
-                        y=alt.value(20),
-                        tooltip=[
-                            alt.Tooltip("Item Label:N", title="Item"),
-                            alt.Tooltip("Year:O", title="Year"),
-                            alt.Tooltip("Bid Status:N", title="Status"),
-                        ],
-                    )
-                    chart = (line + not_bid).properties(height=400)
-
-                st.altair_chart(chart, use_container_width=True)
-        else:
-            year_sort = sorted(history["Year"].dropna().unique().tolist())
-            bid_rows = history[history["Price"].notna()]
-            not_bid_rows = history[history["Price"].isna()]
-            bars = (
-                alt.Chart(bid_rows)
-                .mark_bar()
-                .encode(
-                    x=alt.X("Year:O", title="Year", sort=year_sort),
-                    y=alt.Y("Price:Q", title="Average unit price"),
-                    tooltip=[
-                        alt.Tooltip("Year:O", title="Year"),
-                        alt.Tooltip("Price:Q", title="Average Price", format="$.2f"),
-                        alt.Tooltip("Bid Status:N", title="Status"),
-                    ],
-                )
-            )
-            if not_bid_rows.empty:
-                chart = bars.properties(height=400)
-            else:
-                notes = (
-                    alt.Chart(not_bid_rows)
-                    .mark_text(text="Not bid", dy=-8, fontSize=10)
-                    .encode(
-                        x=alt.X("Year:O", title="Year", sort=year_sort),
-                        y=alt.value(20),
-                        tooltip=[
-                            alt.Tooltip("Year:O", title="Year"),
-                            alt.Tooltip("Bid Status:N", title="Status"),
-                        ],
-                    )
-                )
-                chart = (bars + notes).properties(height=400)
-            st.altair_chart(chart, use_container_width=True)
-
+    st.subheader("Item comparison")
+    table = show_comparison_table(comparison, base_year, comparison_year)
     st.download_button(
-        "Download filtered bids",
-        data=display_df.to_csv(index=False),
-        file_name="filtered_bids.csv",
+        "Download item comparison",
+        data=table.to_csv(index=False),
+        file_name=f"bid_comparison_{base_year}_vs_{comparison_year}.csv",
         mime="text/csv",
-        disabled=display_df.empty,
+        disabled=table.empty,
+    )
+
+    st.subheader("Lowest bid history")
+    show_history_chart(summary, comparison, options["history_years"])
+
+    detail = show_raw_bid_detail(filtered, base_year, comparison_year)
+    st.download_button(
+        "Download raw bids for selected years",
+        data=detail.to_csv(index=False),
+        file_name=f"raw_bids_{base_year}_{comparison_year}.csv",
+        mime="text/csv",
+        disabled=detail.empty,
     )
 
 
