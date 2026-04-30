@@ -12,10 +12,14 @@ import streamlit as st
 
 BASE_DIR = Path(__file__).parent
 ALL_SHEET_NAME = "All"
+BIDEXPRESS_ITEM_LISTS_SHEET_NAME = "Item Lists"
 MASTER_WORKBOOK_NAME = "PRS25-7-3.xlsx"
 MASTER_SHEET_NAME = "Sheet"
 MASTER_ITEM_COLUMN = "Item"
 MASTER_COMB_COLUMN = "Comb"
+BIDNET_SOURCE = "BidNet"
+BIDEXPRESS_SOURCE = "BidExpress"
+ITEM_KEY_COLUMN = "Item Key"
 ITEM_COLUMN_ALIASES = ("Item No", "Item Number", "Item #", "Item")
 NUMERIC_COLUMNS = (
     "Item No",
@@ -26,6 +30,9 @@ NUMERIC_COLUMNS = (
     "Bid Rank",
 )
 WorkbookSource = Union[Path, IO[bytes]]
+ITEM_LISTS_ITEM_PATTERN = re.compile(
+    r"^\s*(?P<item_no>\d{5,})\s*-\s*(?P<description>.*?)\s*-\s*(?P<unit>[A-Za-z]+)\s*$"
+)
 
 st.set_page_config(page_title="Bid Comparison", page_icon="📊", layout="wide")
 
@@ -123,13 +130,51 @@ def _format_item_identifier(value: Any) -> str:
     return str(int(numeric)) if numeric.is_integer() else text
 
 
+def _normalize_item_key_part(value: Any) -> str:
+    """Return a stable text fragment for cross-year item identity."""
+    if pd.isna(value):
+        return ""
+    text = str(value).strip().lower()
+    text = re.sub(r"^_+\s*", "", text)
+    text = text.replace("_", " ")
+    text = re.sub(r"\brcoc\b", "", text)
+    text = re.sub(r"\bsym\b", "symbol", text)
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s+,", ",", text)
+    text = re.sub(r",\s*,", ",", text)
+    return text.strip(" ,")
+
+
+def _add_item_key(df: pd.DataFrame, include_description: bool = False) -> pd.DataFrame:
+    """Attach the internal item identity used for grouping and comparisons."""
+    if "Item No" not in df.columns:
+        return df
+
+    df = df.copy()
+    key = df["Item No"].apply(_format_item_identifier)
+    if include_description and "Description" in df.columns:
+        description_key = df["Description"].apply(_normalize_item_key_part)
+        unit_key = (
+            df["Unit"].apply(_normalize_item_key_part)
+            if "Unit" in df.columns
+            else pd.Series("", index=df.index)
+        )
+        key = key + "|" + description_key + "|" + unit_key
+    df[ITEM_KEY_COLUMN] = key
+    return df
+
+
 def _add_item_labels(df: pd.DataFrame) -> pd.DataFrame:
     """Attach a descriptive Item Label column for display/filtering."""
     if "Item No" not in df.columns:
         return df
 
     df = df.copy()
-    info_cols = ["Item No"]
+    if ITEM_KEY_COLUMN not in df.columns:
+        df = _add_item_key(df)
+
+    identity_col = ITEM_KEY_COLUMN if ITEM_KEY_COLUMN in df.columns else "Item No"
+    info_cols = [identity_col, "Item No"]
     description_column = None
     if "Item Description" in df.columns:
         info_cols.append("Item Description")
@@ -138,7 +183,7 @@ def _add_item_labels(df: pd.DataFrame) -> pd.DataFrame:
         info_cols.append("Description")
         description_column = "Description"
 
-    info = df[info_cols].dropna(subset=["Item No"]).drop_duplicates("Item No")
+    info = df[info_cols].dropna(subset=["Item No"]).drop_duplicates(identity_col)
     fallback = info["Item No"].apply(_format_item_identifier).replace("", "Unknown")
 
     if description_column:
@@ -151,9 +196,9 @@ def _add_item_labels(df: pd.DataFrame) -> pd.DataFrame:
     labels.loc[duplicates] = labels.loc[duplicates] + " (Item " + fallback.loc[duplicates] + ")"
 
     info["Item Label"] = labels
-    label_map = dict(zip(info["Item No"], info["Item Label"]))
+    label_map = dict(zip(info[identity_col], info["Item Label"]))
 
-    df["Item Label"] = df["Item No"].map(label_map)
+    df["Item Label"] = df[identity_col].map(label_map)
     fallback_series = df["Item No"].apply(_format_item_identifier)
     df["Item Label"] = df["Item Label"].fillna("Item " + fallback_series)
     return df
@@ -171,14 +216,25 @@ def _coerce_numeric(df: pd.DataFrame, columns: Union[tuple[str, ...], list[str]]
 def _add_analysis_quantity(df: pd.DataFrame) -> pd.DataFrame:
     """Create a single quantity column for spend-weighted comparisons."""
     df = df.copy()
-    quantity = pd.Series(index=df.index, dtype="float64")
+    quantity: Optional[pd.Series] = None
     for col in ("Item Quantity", "Quantity"):
         if col not in df.columns:
             continue
         current = pd.to_numeric(df[col], errors="coerce")
-        quantity = quantity.combine_first(current)
-    if not quantity.empty:
+        quantity = current if quantity is None else quantity.combine_first(current)
+    if quantity is not None:
         df["Analysis Quantity"] = quantity
+    return df
+
+
+def _add_source_metadata(
+    df: pd.DataFrame, source: str, bid_type: Optional[str]
+) -> pd.DataFrame:
+    """Attach source-family metadata after source-specific parsing."""
+    df = df.copy()
+    df["Source"] = source
+    if bid_type:
+        df["Bid Type"] = bid_type
     return df
 
 
@@ -224,7 +280,7 @@ def _apply_master_descriptions(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _load_all_sheet(
-    xls: pd.ExcelFile, label: str, year_label: str
+    xls: pd.ExcelFile, label: str, year_label: str, bid_type: Optional[str] = None
 ) -> Optional[pd.DataFrame]:
     """Parse the wide-format 'All' sheet into the long bid format."""
     df_raw = pd.read_excel(xls, sheet_name=label, header=None, engine="openpyxl")
@@ -332,14 +388,122 @@ def _load_all_sheet(
     if "Description" in dataset.columns:
         description_text = dataset["Description"].fillna("").astype(str).str.strip()
         dataset = dataset[description_text != ""]
+    dataset = _add_item_key(dataset)
     dataset = _add_item_labels(dataset)
+    dataset = _add_source_metadata(dataset, BIDNET_SOURCE, bid_type)
+    return dataset
+
+
+def _find_bidexpress_header_row(df_raw: pd.DataFrame) -> Optional[int]:
+    """Return the zero-based header row for a BidExpress Item Lists table."""
+    for idx in range(len(df_raw)):
+        first = str(df_raw.iat[idx, 0]).strip().lower()
+        second = str(df_raw.iat[idx, 1]).strip().lower() if df_raw.shape[1] > 1 else ""
+        if first == "item" and second == "quantity":
+            return idx
+    return None
+
+
+def _detect_bidexpress_vendor_pairs(
+    df_raw: pd.DataFrame, header_row: int
+) -> list[tuple[str, int, int]]:
+    """Return bidder name and Price/Extension column pairs from a BidExpress table."""
+    vendor_pairs: list[tuple[str, int, int]] = []
+    if header_row == 0:
+        return vendor_pairs
+
+    for col in range(df_raw.shape[1] - 1):
+        price_header = str(df_raw.iat[header_row, col]).strip().lower()
+        extension_header = str(df_raw.iat[header_row, col + 1]).strip().lower()
+        if price_header != "price" or extension_header != "extension":
+            continue
+
+        vendor_name = str(df_raw.iat[header_row - 1, col]).strip()
+        if not vendor_name or vendor_name.lower() == "nan":
+            continue
+        vendor_pairs.append((vendor_name, col, col + 1))
+
+    return vendor_pairs
+
+
+def _load_bidexpress_item_lists_sheet(
+    xls: pd.ExcelFile,
+    sheet_name: str,
+    workbook_label: str,
+    year_label: str,
+    bid_type: Optional[str] = None,
+) -> Optional[pd.DataFrame]:
+    """Parse BidExpress 'Item Lists' exports into the app's normalized bid format."""
+    df_raw = pd.read_excel(xls, sheet_name=sheet_name, header=None, engine="openpyxl")
+    if df_raw.shape[0] < 3 or df_raw.shape[1] < 4:
+        st.error(f"Workbook '{workbook_label}' has an '{sheet_name}' sheet but no bid table.")
+        return None
+
+    header_row = _find_bidexpress_header_row(df_raw)
+    if header_row is None:
+        st.error(
+            f"Workbook '{workbook_label}' has an '{sheet_name}' sheet but no Item/Quantity header."
+        )
+        return None
+
+    vendor_pairs = _detect_bidexpress_vendor_pairs(df_raw, header_row)
+    if not vendor_pairs:
+        st.error(
+            f"Workbook '{workbook_label}' has an '{sheet_name}' sheet but no bidder Price/Extension columns."
+        )
+        return None
+
+    rows: list[dict[str, Any]] = []
+    for row_idx in range(header_row + 2, len(df_raw)):
+        item_text = df_raw.iat[row_idx, 0]
+        if not isinstance(item_text, str):
+            continue
+
+        match = ITEM_LISTS_ITEM_PATTERN.match(item_text)
+        if not match:
+            continue
+
+        quantity = df_raw.iat[row_idx, 1]
+        item_no = match.group("item_no")
+        description = match.group("description").strip()
+        unit = match.group("unit").strip()
+
+        for vendor_name, price_col, extension_col in vendor_pairs:
+            rows.append(
+                {
+                    "Year": int(year_label),
+                    "Organization Name": vendor_name,
+                    "Item No": item_no,
+                    "Description": description,
+                    "Unit": unit,
+                    "UOM": unit,
+                    "Item Quantity": quantity,
+                    "Price": df_raw.iat[row_idx, price_col],
+                    "Total Cost": df_raw.iat[row_idx, extension_col],
+                }
+            )
+
+    if not rows:
+        st.error(f"Workbook '{workbook_label}' did not contain any BidExpress item rows.")
+        return None
+
+    dataset = pd.DataFrame(rows)
+    dataset = _coerce_numeric(dataset, NUMERIC_COLUMNS)
+    dataset = _add_analysis_quantity(dataset)
+    dataset = dataset.dropna(subset=["Item No", "Price", "Total Cost"], how="all")
+    dataset = _add_item_key(dataset, include_description=True)
+    dataset = _add_item_labels(dataset)
+    dataset = _add_source_metadata(dataset, BIDEXPRESS_SOURCE, bid_type)
     return dataset
 
 
 def _load_year_dataset(
-    source: WorkbookSource, label: str, year_label: str
+    source: WorkbookSource,
+    label: str,
+    year_label: str,
+    bid_type: Optional[str] = None,
 ) -> Optional[pd.DataFrame]:
-    """Read the All sheet for a workbook."""
+    """Read a workbook through the matching source-specific parser."""
     try:
         xls = pd.ExcelFile(source, engine="openpyxl")
     except PermissionError:
@@ -352,11 +516,24 @@ def _load_year_dataset(
         return None
 
     all_sheet = _resolve_sheet_name(xls, ALL_SHEET_NAME)
-    if all_sheet is None:
-        st.error(f"Workbook '{label}' is missing an '{ALL_SHEET_NAME}' sheet.")
-        return None
+    if all_sheet is not None:
+        return _load_all_sheet(xls, all_sheet, year_label, bid_type=bid_type)
 
-    return _load_all_sheet(xls, all_sheet, year_label)
+    item_lists_sheet = _resolve_sheet_name(xls, BIDEXPRESS_ITEM_LISTS_SHEET_NAME)
+    if item_lists_sheet is not None:
+        return _load_bidexpress_item_lists_sheet(
+            xls,
+            item_lists_sheet,
+            workbook_label=label,
+            year_label=year_label,
+            bid_type=bid_type,
+        )
+
+    st.error(
+        f"Workbook '{label}' is missing an '{ALL_SHEET_NAME}' sheet and a "
+        f"'{BIDEXPRESS_ITEM_LISTS_SHEET_NAME}' sheet."
+    )
+    return None
 
 
 def load_datasets() -> Dict[str, pd.DataFrame]:
@@ -384,7 +561,9 @@ def load_datasets() -> Dict[str, pd.DataFrame]:
                 st.warning(f"Missing file: {path}")
                 continue
 
-            dataset = _load_year_dataset(path, label=str(path), year_label=year)
+            dataset = _load_year_dataset(
+                path, label=str(path), year_label=year, bid_type=search_dir.name
+            )
             if dataset is not None:
                 datasets[year] = dataset
                 st.caption(f"Loaded {len(dataset):,} bid rows.")
@@ -423,18 +602,19 @@ def apply_filters(df: pd.DataFrame) -> tuple[pd.DataFrame, Dict[str, Any]]:
         pd.to_numeric(df["Year"], errors="coerce").dropna().astype(int).unique().tolist()
     )
     default_base, default_comparison = _default_year_pair(year_values)
+    identity_col = ITEM_KEY_COLUMN if ITEM_KEY_COLUMN in df.columns else "Item No"
 
     item_info = (
-        df[["Item No", "Item Label"]]
-        .dropna(subset=["Item No"])
-        .drop_duplicates("Item No")
+        df[[identity_col, "Item No", "Item Label"]]
+        .dropna(subset=[identity_col])
+        .drop_duplicates(identity_col)
         .sort_values("Item Label")
         if "Item Label" in df.columns
-        else pd.DataFrame({"Item No": sorted(df["Item No"].dropna().unique().tolist())})
+        else pd.DataFrame({identity_col: sorted(df[identity_col].dropna().unique().tolist())})
     )
     if "Item Label" not in item_info.columns:
         item_info = item_info.copy()
-        item_info["Item Label"] = item_info["Item No"].apply(_format_item_identifier)
+        item_info["Item Label"] = item_info[identity_col].apply(_format_item_identifier)
 
     with st.sidebar:
         st.header("Comparison")
@@ -491,12 +671,12 @@ def apply_filters(df: pd.DataFrame) -> tuple[pd.DataFrame, Dict[str, Any]]:
 
     filtered = df.copy()
     if item_query:
-        filtered = filtered[filtered["Item No"].isin(filtered_item_info["Item No"])]
+        filtered = filtered[filtered[identity_col].isin(filtered_item_info[identity_col])]
     if selected_labels:
-        selected_numbers = filtered_item_info[
+        selected_items = filtered_item_info[
             filtered_item_info["Item Label"].isin(selected_labels)
-        ]["Item No"].tolist()
-        filtered = filtered[filtered["Item No"].isin(selected_numbers)]
+        ][identity_col].tolist()
+        filtered = filtered[filtered[identity_col].isin(selected_items)]
 
     return filtered, {
         "base_year": int(base_year) if base_year is not None else None,
@@ -510,17 +690,18 @@ def _extract_lowest_bids(df: pd.DataFrame) -> pd.DataFrame:
     required = {"Item No", "Year", "Price"}
     if df.empty or not required.issubset(df.columns):
         return pd.DataFrame(columns=df.columns)
+    identity_col = ITEM_KEY_COLUMN if ITEM_KEY_COLUMN in df.columns else "Item No"
     subset = df.dropna(subset=["Price"]).copy()
     if subset.empty:
         return pd.DataFrame(columns=df.columns)
-    sort_fields = ["Item No", "Year", "Price"]
+    sort_fields = [identity_col, "Year", "Price"]
     if "Bid Rank" in subset.columns:
         sort_fields.append("Bid Rank")
     if "Organization Name" in subset.columns:
         sort_fields.append("Organization Name")
     subset = subset.sort_values(sort_fields)
     winners = (
-        subset.groupby(["Item No", "Year"], as_index=False)
+        subset.groupby([identity_col, "Year"], as_index=False)
         .first()
         .copy()
     )
@@ -560,30 +741,35 @@ def build_item_year_summary(df: pd.DataFrame) -> pd.DataFrame:
 
     base = _add_analysis_quantity(df)
     base = base.copy()
+    if ITEM_KEY_COLUMN not in base.columns:
+        base = _add_item_key(base)
+    identity_col = ITEM_KEY_COLUMN if ITEM_KEY_COLUMN in base.columns else "Item No"
     base["Year"] = pd.to_numeric(base["Year"], errors="coerce")
     base["Item No"] = pd.to_numeric(base["Item No"], errors="coerce")
-    base = base.dropna(subset=["Item No", "Year"])
+    base = base.dropna(subset=[identity_col, "Item No", "Year"])
     if base.empty:
         return pd.DataFrame()
     base["Year"] = base["Year"].astype(int)
 
     metadata_cols = [
         col
-        for col in [
+        for col in dict.fromkeys([
+            identity_col,
             "Item No",
             "Year",
             "Item Label",
             "Description",
+            "Unit",
             "UOM",
             "Analysis Quantity",
-        ]
+        ])
         if col in base.columns
     ]
     metadata = (
-        base.sort_values(["Year", "Item No"], ascending=[False, True])[metadata_cols]
-        .drop_duplicates(["Item No", "Year"])
+        base.sort_values(["Year", identity_col], ascending=[False, True])[metadata_cols]
+        .drop_duplicates([identity_col, "Year"])
         if metadata_cols
-        else pd.DataFrame(columns=["Item No", "Year"])
+        else pd.DataFrame(columns=[identity_col, "Year"])
     )
 
     priced = base.dropna(subset=["Price"]).copy()
@@ -603,7 +789,7 @@ def build_item_year_summary(df: pd.DataFrame) -> pd.DataFrame:
             result[col] = pd.NA
         return result
 
-    summary = priced.groupby(["Item No", "Year"], as_index=False).agg(
+    summary = priced.groupby([identity_col, "Year"], as_index=False).agg(
         **{
             "Bid Count": ("Price", "size"),
             "Average Price": ("Price", "mean"),
@@ -614,16 +800,16 @@ def build_item_year_summary(df: pd.DataFrame) -> pd.DataFrame:
 
     if "Organization Name" in priced.columns:
         bidder_counts = (
-            priced.groupby(["Item No", "Year"])["Organization Name"]
+            priced.groupby([identity_col, "Year"])["Organization Name"]
             .nunique()
             .reset_index(name="Bidder Count")
         )
-        summary = summary.merge(bidder_counts, on=["Item No", "Year"], how="left")
+        summary = summary.merge(bidder_counts, on=[identity_col, "Year"], how="left")
     else:
         summary["Bidder Count"] = pd.NA
 
     winners = _extract_lowest_bids(base)
-    winner_cols = ["Item No", "Year"]
+    winner_cols = [identity_col, "Year"]
     rename_map: Dict[str, str] = {}
     if "Organization Name" in winners.columns:
         winner_cols.append("Organization Name")
@@ -636,8 +822,8 @@ def build_item_year_summary(df: pd.DataFrame) -> pd.DataFrame:
         rename_map["Total Cost"] = "Lowest Total Cost"
 
     winner_summary = winners[winner_cols].rename(columns=rename_map)
-    result = metadata.merge(summary, on=["Item No", "Year"], how="outer")
-    result = result.merge(winner_summary, on=["Item No", "Year"], how="left")
+    result = metadata.merge(summary, on=[identity_col, "Year"], how="outer")
+    result = result.merge(winner_summary, on=[identity_col, "Year"], how="left")
     if {"Lowest Price", "Analysis Quantity"}.issubset(result.columns):
         result["Estimated Low Spend"] = result["Lowest Price"] * result["Analysis Quantity"]
     else:
@@ -651,17 +837,18 @@ def build_year_pair_comparison(
     """Return a side-by-side comparison for the selected year pair."""
     if summary.empty:
         return pd.DataFrame()
+    identity_col = ITEM_KEY_COLUMN if ITEM_KEY_COLUMN in summary.columns else "Item No"
 
     item_info_cols = [
         col
-        for col in ["Item No", "Item Label", "Description", "UOM"]
+        for col in dict.fromkeys([identity_col, "Item No", "Item Label", "Description", "Unit", "UOM"])
         if col in summary.columns
     ]
     item_info = (
-        summary.sort_values(["Year", "Item No"], ascending=[False, True])[item_info_cols]
-        .drop_duplicates("Item No")
+        summary.sort_values(["Year", identity_col], ascending=[False, True])[item_info_cols]
+        .drop_duplicates(identity_col)
         if item_info_cols
-        else pd.DataFrame(columns=["Item No"])
+        else pd.DataFrame(columns=[identity_col])
     )
 
     metric_cols = [
@@ -682,14 +869,14 @@ def build_year_pair_comparison(
     ]
 
     def _year_frame(year: int) -> pd.DataFrame:
-        frame = summary[summary["Year"] == year][["Item No"] + metric_cols].copy()
-        rename = {col: f"{col} {year}" for col in frame.columns if col != "Item No"}
+        frame = summary[summary["Year"] == year][[identity_col] + metric_cols].copy()
+        rename = {col: f"{col} {year}" for col in frame.columns if col != identity_col}
         return frame.rename(columns=rename)
 
     base_frame = _year_frame(base_year)
     comparison_frame = _year_frame(comparison_year)
-    result = item_info.merge(base_frame, on="Item No", how="left")
-    result = result.merge(comparison_frame, on="Item No", how="left")
+    result = item_info.merge(base_frame, on=identity_col, how="left")
+    result = result.merge(comparison_frame, on=identity_col, how="left")
 
     base_price_col = f"Lowest Price {base_year}"
     comparison_price_col = f"Lowest Price {comparison_year}"
@@ -931,7 +1118,8 @@ def show_top_moves_chart(comparison: pd.DataFrame, base_year: int, comparison_ye
     if chart_df.empty:
         chart_df = overlap.nlargest(min(12, len(overlap)), "Absolute Price Change")
 
-    chart_df = chart_df.drop_duplicates("Item No").copy()
+    identity_col = ITEM_KEY_COLUMN if ITEM_KEY_COLUMN in chart_df.columns else "Item No"
+    chart_df = chart_df.drop_duplicates(identity_col).copy()
     chart_df["Direction"] = chart_df["Price Change"].apply(
         lambda value: "Increase" if value > 0 else "Decrease"
     )
@@ -980,13 +1168,14 @@ def show_top_moves_chart(comparison: pd.DataFrame, base_year: int, comparison_ye
     st.altair_chart((zero + bars).properties(height=height), use_container_width=True)
 
 
-def prepare_history(summary: pd.DataFrame, item_numbers: list[float], years: list[int]) -> pd.DataFrame:
-    if summary.empty or not item_numbers or not years:
+def prepare_history(summary: pd.DataFrame, item_keys: list[Any], years: list[int]) -> pd.DataFrame:
+    if summary.empty or not item_keys or not years:
         return pd.DataFrame()
+    identity_col = ITEM_KEY_COLUMN if ITEM_KEY_COLUMN in summary.columns else "Item No"
 
     item_info = (
-        summary[summary["Item No"].isin(item_numbers)][["Item No", "Item Label"]]
-        .drop_duplicates("Item No")
+        summary[summary[identity_col].isin(item_keys)][[identity_col, "Item Label"]]
+        .drop_duplicates(identity_col)
         .sort_values("Item Label")
     )
     if item_info.empty:
@@ -1000,19 +1189,20 @@ def prepare_history(summary: pd.DataFrame, item_numbers: list[float], years: lis
 
     summary_cols = [
         col
-        for col in [
+        for col in dict.fromkeys([
             "Item No",
+            identity_col,
             "Year",
             "Lowest Price",
             "Lowest Bidder",
             "Bid Count",
             "Bidder Count",
-        ]
+        ])
         if col in summary.columns
     ]
     history = grid.merge(
         summary[summary["Year"].isin(years)][summary_cols],
-        on=["Item No", "Year"],
+        on=[identity_col, "Year"],
         how="left",
     )
     history["Bid Status"] = history["Lowest Price"].where(
@@ -1030,10 +1220,11 @@ def show_history_chart(summary: pd.DataFrame, comparison: pd.DataFrame, years: l
         return
 
     chart_item_info = (
-        comparison[["Item No", "Item Label", "Absolute Price Change"]]
-        .drop_duplicates("Item No")
+        comparison[[ITEM_KEY_COLUMN if ITEM_KEY_COLUMN in comparison.columns else "Item No", "Item Label", "Absolute Price Change"]]
+        .drop_duplicates(ITEM_KEY_COLUMN if ITEM_KEY_COLUMN in comparison.columns else "Item No")
         .sort_values(["Absolute Price Change", "Item Label"], ascending=[False, True])
     )
+    identity_col = ITEM_KEY_COLUMN if ITEM_KEY_COLUMN in chart_item_info.columns else "Item No"
     label_options = chart_item_info["Item Label"].tolist()
     default_labels = label_options[: min(5, len(label_options))]
     selected_labels = st.multiselect(
@@ -1048,7 +1239,7 @@ def show_history_chart(summary: pd.DataFrame, comparison: pd.DataFrame, years: l
 
     selected_items = chart_item_info[
         chart_item_info["Item Label"].isin(selected_labels)
-    ]["Item No"].tolist()
+    ][identity_col].tolist()
     history = prepare_history(summary, selected_items, years)
     if history.empty:
         st.info("No history is available for the selected items.")
@@ -1067,7 +1258,7 @@ def show_history_chart(summary: pd.DataFrame, comparison: pd.DataFrame, years: l
         .encode(
             **base_encoding,
             y=alt.Y("Lowest Price:Q", title="Lowest bid price"),
-            detail="Item No:N",
+            detail=f"{identity_col}:N",
             tooltip=[
                 alt.Tooltip("Item Label:N", title="Item"),
                 alt.Tooltip("Year:O", title="Year"),
